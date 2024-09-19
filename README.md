@@ -2,6 +2,8 @@
 
 FileSniper is a fast and simple CLI tool that scans your computer for large files.
 
+![Preview Image](preview.png)
+
 ## Building
 macOS
 ```bash
