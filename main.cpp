@@ -180,6 +180,7 @@ int main(int argc, char* argv[])
         usleep(100'000); // 1/10 s
     }
 
+    nocbreak();
     endwin();
     
     return 0;
