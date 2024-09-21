@@ -1,5 +1,4 @@
 #include <ncurses.h>
-#include <unistd.h>
 #include <iostream>
 #include <filesystem>
 #include <vector>
@@ -8,6 +7,7 @@
 #include <algorithm>
 #include <chrono>
 #include <format>
+#include <atomic>
 
 struct file_size
 {
@@ -15,14 +15,77 @@ struct file_size
     size_t size;
 };
 
-std::mutex lock;
-size_t files_scanned = 0;
-size_t directories_scanned = 0;
-std::vector<std::filesystem::path> directory_queue;
-std::vector<file_size> largest_files;
+template <typename T>
+struct thread_safe_vector
+{
+    void add(const T& value)
+    {
+        std::scoped_lock scope_lock(lock);
+        vec.push_back(value);
+    }
+
+    void append(const std::vector<T>& others)
+    {
+        std::scoped_lock scope_lock(lock);
+        vec.insert(vec.end(), others.begin(), others.end());
+    }
+
+    void resize(const size_t size)
+    {
+        std::scoped_lock scope_lock(lock);
+        vec.resize(size);
+    }
+
+    void stable_sort(const std::function<bool(const T&, const T&)> order_func)
+    {
+        std::scoped_lock scope_lock(lock);
+        std::stable_sort(vec.begin(), vec.end(), order_func);
+    }
+
+    std::vector<T> get_copy()
+    {
+        std::scoped_lock scope_lock(lock);
+        return vec;
+    }
+
+    void transfer(const size_t count, std::vector<T>& destination)
+    {
+        std::scoped_lock scope_lock(lock);
+        if (!vec.empty())
+        {
+            const size_t take_count = std::min<size_t>(count, vec.size());
+
+            destination.resize(take_count);
+            std::copy(vec.begin(), vec.begin() + take_count, destination.begin());
+
+            vec.erase(vec.begin(), vec.begin() + take_count);
+        }
+    }
+
+    bool is_empty()
+    {
+        std::scoped_lock scope_lock(lock);
+        return vec.empty();
+    }
+
+private:
+    std::vector<T> vec;
+    std::mutex lock;
+};
+
+thread_safe_vector<std::filesystem::path> directory_queue;
+thread_safe_vector<file_size> largest_files;
+
+std::atomic<bool> stop_flag(false);
+std::atomic<int> failed_reads = 0;
+std::atomic<int> threads_working = 0;
+std::atomic<size_t> files_scanned = 0;
+std::atomic<size_t> directories_scanned = 0;
 
 void process_directories(const std::vector<std::filesystem::path>& paths)
 {
+    ++threads_working;
+
     std::vector<file_size> file_sizes;
     std::vector<std::filesystem::path> directories;
 
@@ -49,42 +112,37 @@ void process_directories(const std::vector<std::filesystem::path>& paths)
     }
     catch (const std::exception& e)
     {
+        ++failed_reads;
         // Cannot read directory
     }
 
-    lock.lock();
-    directory_queue.insert(directory_queue.end(), directories.begin(), directories.end());
-    largest_files.insert(largest_files.end(), file_sizes.begin(), file_sizes.end());
-    std::stable_sort(largest_files.begin(), largest_files.end(), [](const file_size& lhs, const file_size& rhs)
+    directory_queue.append(directories);
+
+    largest_files.append(file_sizes);
+    largest_files.stable_sort([](const file_size& lhs, const file_size& rhs)
     {
         return lhs.size > rhs.size;
     });
     largest_files.resize(100);
+    
     files_scanned += file_sizes.size();
     directories_scanned += directories.size();
-    lock.unlock();
+    
+    --threads_working;
 }
 
 void thread_job()
 {
-    while (true)
-    {
-        lock.lock();
-        if (!directory_queue.empty())
-        {
-            const auto first = directory_queue.begin();
-            const size_t take_count = std::min<size_t>(100, directory_queue.size());
-            const auto last = directory_queue.begin() + take_count;
-            std::vector<std::filesystem::path> paths(first, last);
-            directory_queue.erase(directory_queue.begin(), directory_queue.begin() + take_count);
-            lock.unlock();
+    std::vector<std::filesystem::path> directories;
 
-            process_directories(paths);
-        }
-        else
+    while (!stop_flag.load())
+    {
+        directory_queue.transfer(100, directories);
+        if (!directories.empty())
         {
-            lock.unlock();
+            process_directories(directories);
         }
+        directories.clear();
     }
 }
 
@@ -117,22 +175,20 @@ std::string pretty_bytes(const size_t size)
     return std::format("{:.2f} GB", static_cast<double>(size) / 1'000'000'000); 
 }
 
-void render_frame(const terminal_context& context)
+void render_frame(const terminal_context& terminal_ctx)
 {
-    lock.lock();
+    const std::vector<file_size>& local_largest_files = largest_files.get_copy();
 
-    for (int i = 0; i < context.max_y - 4; i++)
+    for (int i = 0; i < std::min<int>(terminal_ctx.max_y - 4, local_largest_files.size()); i++)
     {
-        const auto&[path, size] = largest_files[i];
+        const auto&[path, size] = local_largest_files[i];
 
-        mvprintw(i + 2, 0, pretty_bytes(size).c_str());
-        mvprintw(i + 2, 15, path.c_str());
+        mvprintw(i + 2, 5, pretty_bytes(size).c_str());
+        mvprintw(i + 2, 20, path.c_str());
     }
 
-    mvprintw(0, 0, "FILE SNIPER | %d files scanned | %d directories scanned", files_scanned, directories_scanned);
-    mvprintw(context.max_y - 1, 0, "(Q) - Quit");
-
-    lock.unlock();
+    mvprintw(0, 0, "FILE SNIPER | %d files scanned | %d directories scanned | %d threads active | %d failed directories | %s", files_scanned.load(), directories_scanned.load(), threads_working.load(), failed_reads.load(), stop_flag.load() ? "Complete" : "Searching...");
+    mvprintw(terminal_ctx.max_y - 1, 0, "(Q) - Quit");
 }
 
 int main(int argc, char* argv[])
@@ -143,7 +199,7 @@ int main(int argc, char* argv[])
         return 1;
     }
 
-    directory_queue.push_back(std::filesystem::path(argv[1]));
+    directory_queue.add(std::filesystem::path(argv[1]));
 
     std::vector<std::thread> workers;
     workers.reserve(std::thread::hardware_concurrency());
@@ -166,18 +222,24 @@ int main(int argc, char* argv[])
             break;
         }
 
+        if (threads_working.load() == 0 && directory_queue.is_empty())
+        {
+            stop_flag = true;
+        }
+
         // render
         {
             clear();
 
-            terminal_context context;
-            getmaxyx(stdscr, context.max_y, context.max_x);
+            terminal_context terminal_ctx;
+            getmaxyx(stdscr, terminal_ctx.max_y, terminal_ctx.max_x);
 
-            render_frame(context);
+            render_frame(terminal_ctx);
             refresh();
         }
 
-        usleep(100'000); // 1/10 s
+        using namespace std::chrono_literals;
+        std::this_thread::sleep_for(100ms);
     }
 
     nocbreak();
