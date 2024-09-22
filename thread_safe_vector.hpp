@@ -3,10 +3,25 @@
 template <typename T>
 struct thread_safe_vector
 {
-    void add(const T& value)
+    void emplace_back(T value)
     {
         std::scoped_lock scope_lock(lock);
-        vec.push_back(value);
+        vec.emplace_back(std::move(value));
+    }
+
+    void insert_sorted(T value)
+    {
+        std::scoped_lock scope_lock(lock);
+
+        auto it = vec.begin();
+        while (it != vec.end() && *it < value) {
+            ++it;
+        }
+
+        if (it - vec.begin() < 100)
+        {
+            vec.insert(it, value);
+        }
     }
 
     void append(const std::vector<T>& others)
@@ -45,6 +60,22 @@ struct thread_safe_vector
 
         if (!vec.empty())
         {
+            out = vec.back();
+            vec.pop_back();
+            return true;
+        }
+
+        return false;
+    }
+
+    bool pop_and_increment(T& out, std::atomic<int>& k)
+    {
+        std::scoped_lock scope_lock(lock);
+
+        if (!vec.empty())
+        {
+            ++k;
+
             out = vec.back();
             vec.pop_back();
             return true;

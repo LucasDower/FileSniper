@@ -12,8 +12,8 @@
 
 struct file_size
 {
-    std::filesystem::path path;
-    size_t size;
+    std::filesystem::path path = "";
+    size_t size = 0;
 };
 
 struct file_sniper_context
@@ -22,11 +22,41 @@ struct file_sniper_context
     thread_safe_vector<file_size> largest_files;
 
     std::atomic<int> threads_working = 0;
+    std::mutex dump;
 };
 
 struct thread_context
 {
     std::vector<file_size> files;
+
+    thread_context()
+    {
+        files.resize(100);
+    }
+
+    void insert_sorted(file_size value)
+    {
+        int i = 0;
+        for (; i < files.size(); ++i)
+        {
+            if (value.size > files[i].size)
+            {
+                break;
+            }
+        }
+        
+        if (i == files.size())
+        {
+            return;
+        }
+
+        for (int j = files.size() - 1; j > i; --j)
+        {
+            files[j] = files[j - 1];
+        }
+
+        files[i] = value;
+    }
 };
 
 void process_directory(file_sniper_context& file_sniper_ctx, thread_context& thread_ctx, const std::filesystem::path& path)
@@ -39,13 +69,13 @@ void process_directory(file_sniper_context& file_sniper_ctx, thread_context& thr
         {
             if (file.is_regular_file())
             {
-                //file_sniper_ctx.largest_files.add(file_size{ file.path(), file.file_size() });
-                thread_ctx.files.emplace_back(file.path(), file.file_size());
+                //file_sniper_ctx.largest_files.insert_sorted(file_size{ file.path(), file.file_size() });
+                //thread_ctx.files.emplace_back(file.path(), file.file_size());
+                thread_ctx.insert_sorted(file_size{ file.path(), file.file_size() });
             }
             else if (file.is_directory())
             {
-                file_sniper_ctx.directory_queue.add(file.path());
-                //thread_ctx.directories.emplace_back(file.path());
+                file_sniper_ctx.directory_queue.emplace_back(file.path());
             }
             else
             {
@@ -79,7 +109,14 @@ void thread_job(file_sniper_context& file_sniper_ctx)
         }
     }
 
-    file_sniper_ctx.largest_files.append(thread_ctx.files);
+    file_sniper_ctx.dump.lock();
+    std::cout << "Thread: " << std::this_thread::get_id() << std::endl;
+    for (const auto& file : thread_ctx.files)
+    {
+        std::cout << file.size << " : " << file.path << std::endl;
+    }
+    std::cout << std::endl;
+    file_sniper_ctx.dump.unlock();
 }
 
 int main(int argc, char* argv[])
@@ -93,7 +130,7 @@ int main(int argc, char* argv[])
     const auto start = std::chrono::high_resolution_clock::now();
 
     file_sniper_context file_sniper_ctx;
-    file_sniper_ctx.directory_queue.add(argv[1]);
+    file_sniper_ctx.directory_queue.emplace_back(argv[1]);
 
     std::vector<std::thread> workers;
 
